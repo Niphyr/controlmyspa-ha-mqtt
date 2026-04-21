@@ -24,9 +24,11 @@ logDebug(JSON.stringify(config));
 
 class App extends EventEmitter {
   mqtt;
-  spa;
+  spas = [];
   config;
-  tempRange;
+  tempRanges = {};
+  mqttListenersRegistered = false;
+
   constructor(config) {
     super();
 
@@ -39,16 +41,17 @@ class App extends EventEmitter {
 
     this.config = config;
     let spaClient = new ControlMySpa(config.spaUser, config.spaPassword, config.useCelsius);
-    this.spa = new Spa(spaClient, config);
-    this.registerSpaEventListeners();
-    this.spa.init();
+    let primarySpa = new Spa(spaClient, config);
+    this.spas.push(primarySpa);
+    this.registerSpaEventListeners(primarySpa, true);
+    primarySpa.init();
   }
 
   startPollers() {
     let self = this;
     // Update status
     setInterval(() => {
-       self.spa.updateSpa();
+      self.spas.forEach(spa => spa.updateSpa());
     }, 60 * 1000 * self.config.refreshSpa);
   }
 
@@ -58,6 +61,8 @@ class App extends EventEmitter {
   }
 
   registerMqttEventListeners() {
+    if (this.mqttListenersRegistered) return;
+    this.mqttListenersRegistered = true;
     let self = this;   
     self.mqtt.on('connect', () => {
       self.mqttConnected();
@@ -78,50 +83,66 @@ class App extends EventEmitter {
 
   }
 
-  registerSpaEventListeners() { 
+  registerSpaEventListeners(spa, isPrimary = false) { 
     let self = this;  
-    self.spa.on('initialized', () => {
-      logInfo("Spa initialized");
-      self.setupSubscriptions();
-      self.registerMqttEventListeners();
-      if (self.mqtt.connected) {
-        self.mqttConnected();
+    spa.on('initialized', () => {
+      logInfo(`Spa ${spa.getSpaId()} initialized`);
+      self.setupSubscriptions(spa);
+      if (isPrimary) {
+        self.registerMqttEventListeners();
+        if (self.mqtt.connected) {
+          self.mqttConnected();
+        }
+        self.startPollers();
+        // Spin up additional Spa instances for each remaining spa on the account
+        const allSpaIds = spa.client.allSpaIds || [];
+        const primaryId = spa.getSpaId();
+        let spaIndex = 1;
+        allSpaIds.filter(id => id !== primaryId).forEach(spaId => {
+          logInfo(`Creating additional spa instance for ${spaId}`);
+          const clonedClient = spa.client.createForSpa(spaId);
+          const additionalSpa = new Spa(clonedClient, self.config);
+          additionalSpa.displayName = `ControlMySpa ${spaIndex + 1}`;
+          spaIndex++;
+          self.spas.push(additionalSpa);
+          self.registerSpaEventListeners(additionalSpa, false);
+          additionalSpa.initPreAuthenticated();
+        });
       }
-      self.startPollers();
-      self.discovery();
+      self.discovery(spa);
     });
 
-    self.spa.on('status_updated', () => {
-      logDebug("Spa updated");
-      self.publishSpaState();
+    spa.on('status_updated', () => {
+      logDebug(`Spa ${spa.getSpaId()} updated`);
+      self.publishSpaState(spa);
     });
 
-    self.spa.on('temp_range_updated', () => {
-      logDebug("Temp range updated");
-      self.tempRange = self.spa.getTempRange();
-      self.climateDiscovery(self.spa);
+    spa.on('temp_range_updated', () => {
+      logDebug(`Temp range updated for spa ${spa.getSpaId()}`);
+      self.tempRanges[spa.getSpaId()] = spa.getTempRange();
+      self.climateDiscovery(spa);
     });
   }
 
-  setupSubscriptions() {
+  setupSubscriptions(spa) {
     let self = this;
-    let topicPrefix = `controlmyspa/${self.spa.getSpaId()}`;
+    let topicPrefix = `controlmyspa/${spa.getSpaId()}`;
     self.mqtt.subscribe(`${topicPrefix}/refresh`);
     self.mqtt.subscribe(`${topicPrefix}/heaterMode`);
     self.mqtt.subscribe(`${topicPrefix}/tempRange`);
     self.mqtt.subscribe(`${topicPrefix}/temp`);
     self.mqtt.subscribe(`${topicPrefix}/panelLock`);
     self.mqtt.subscribe(`${topicPrefix}/timeSync`);
-    self.spa.getLights().forEach(light => {
+    spa.getLights().forEach(light => {
       self.mqtt.subscribe(`${topicPrefix}/light/${light.port}/set`);
     });
-    self.spa.getBlowers().forEach(blower => {
+    spa.getBlowers().forEach(blower => {
       self.mqtt.subscribe(`${topicPrefix}/blower/${blower.port}/set`);
     });
-    self.spa.getPumps().forEach(pump => {
+    spa.getPumps().forEach(pump => {
       self.mqtt.subscribe(`${topicPrefix}/pump/${pump.port}/set`);
     });
-    self.spa.getFilters().forEach(filter => {
+    spa.getFilters().forEach(filter => {
       self.mqtt.subscribe(`${topicPrefix}/filter/${filter.port}/time/set`);
       self.mqtt.subscribe(`${topicPrefix}/filter/${filter.port}/duration/set`);
       if (filter.port == 1) {
@@ -130,54 +151,55 @@ class App extends EventEmitter {
     });
   }
 
-  publishSpaState() {
+  publishSpaState(spa) {
     let self = this;
-    let topicPrefix = `controlmyspa/${self.spa.getSpaId()}`;
+    let spaId = spa.getSpaId();
+    let topicPrefix = `controlmyspa/${spaId}`;
     let state = {
-      spaId: self.spa.getSpaId(),
-      currentTemp: self.spa.getCurrentTemp(),
-      desiredTemp: self.spa.getDesiredTemp(),
-      targetDesiredTemp: self.spa.getTargetDesiredTemp(),
-      tempRange: self.spa.getTempRange(),
-      heaterMode: self.spa.getHeaterMode(),
-      online: self.spa.isOnline(),
-      panelLocked: self.spa.isPanelLocked(),
-      minTemp: self.spa.getRangeLowTemp(),
-      maxTemp: self.spa.getRangeHighTemp(),
-      time: self.spa.getTime(),
-      device: self.spa.getDeviceInfo(),
-      owner: self.spa.getOwnerInfo()
+      spaId: spaId,
+      currentTemp: spa.getCurrentTemp(),
+      desiredTemp: spa.getDesiredTemp(),
+      targetDesiredTemp: spa.getTargetDesiredTemp(),
+      tempRange: spa.getTempRange(),
+      heaterMode: spa.getHeaterMode(),
+      online: spa.isOnline(),
+      panelLocked: spa.isPanelLocked(),
+      minTemp: spa.getRangeLowTemp(),
+      maxTemp: spa.getRangeHighTemp(),
+      time: spa.getTime(),
+      device: spa.getDeviceInfo(),
+      owner: spa.getOwnerInfo()
     };
-    if (self.tempRange !== self.spa.getTempRange()) {
-      self.spa.emit('temp_range_updated');
+    if (self.tempRanges[spaId] !== spa.getTempRange()) {
+      spa.emit('temp_range_updated');
     }
     logDebug(`Publishing spa state: ${JSON.stringify(state)}`);
     self.mqtt.publish(`${topicPrefix}/spa`, JSON.stringify(state), { retain: true });
-    self.spa.getLights().forEach(light => {
+    spa.getLights().forEach(light => {
       logDebug(`Publishing light state: ${JSON.stringify(light)}`);
       self.mqtt.publish(`${topicPrefix}/light/${light.port}`, JSON.stringify(light), { retain: true });
     });
-    self.spa.getBlowers().forEach(blower => {
+    spa.getBlowers().forEach(blower => {
       logDebug(`Publishing blower state: ${JSON.stringify(blower)}`);
       self.mqtt.publish(`${topicPrefix}/blower/${blower.port}`, JSON.stringify(blower), { retain: true });
     });
-    self.spa.getPumps().forEach(pump => {
+    spa.getPumps().forEach(pump => {
       logDebug(`Publishing pump state: ${JSON.stringify(pump)}`);
       self.mqtt.publish(`${topicPrefix}/pump/${pump.port}`, JSON.stringify(pump), { retain: true });
     });
-    self.spa.getCirculationPumps().forEach(pump => {
+    spa.getCirculationPumps().forEach(pump => {
       logDebug(`Publishing circulation pump state: ${JSON.stringify(pump)}`);
       self.mqtt.publish(`${topicPrefix}/circulation_pump`, JSON.stringify(pump), { retain: true });
     });
-    self.spa.getOzone().forEach(ozone => {
+    spa.getOzone().forEach(ozone => {
       logDebug(`Publishing ozone state: ${JSON.stringify(ozone)}`);
       self.mqtt.publish(`${topicPrefix}/ozone`, JSON.stringify(ozone), { retain: true });
     });
-    self.spa.getHeaters().forEach(heater => {
+    spa.getHeaters().forEach(heater => {
       logDebug(`Publishing heater state: ${JSON.stringify(heater)}`);
       self.mqtt.publish(`${topicPrefix}/heater/${heater.port}`, JSON.stringify(heater), { retain: true });
     });
-    self.spa.getFilters().forEach(filter => {
+    spa.getFilters().forEach(filter => {
       const filterTopic = `${topicPrefix}/filter/${filter.port}`;
       logDebug(`Publishing filter state: ${JSON.stringify(filter)}`);
       const startTime = `${filter.hour.toString().padStart(2, '0')}:${filter.minute.toString().padStart(2, '0')}`;
@@ -192,38 +214,38 @@ class App extends EventEmitter {
     });
   }
 
-  discovery() {
+  discovery(spa) {
     let self = this;
-    logInfo("Starting mqtt discovery");
-    self.tempRange = self.spa.getTempRange();
-    self.spaSensorDiscovery(self.spa);
-    self.sensorsDiscovery(self.spa);
-    self.climateDiscovery(self.spa);
-    self.panelLockDiscovery(self.spa);
-    self.spa.getLights().forEach(light => {
-      self.componentSwitchDiscovery(self.spa, light, "light", "mdi:lightbulb");
-      self.componentBinarySensorDiscovery(self.spa, light, "light", "mdi:lightbulb", "HIGH");
+    logInfo(`Starting mqtt discovery for spa ${spa.getSpaId()}`);
+    self.tempRanges[spa.getSpaId()] = spa.getTempRange();
+    self.spaSensorDiscovery(spa);
+    self.sensorsDiscovery(spa);
+    self.climateDiscovery(spa);
+    self.panelLockDiscovery(spa);
+    spa.getLights().forEach(light => {
+      self.componentSwitchDiscovery(spa, light, "light", "mdi:lightbulb");
+      self.componentBinarySensorDiscovery(spa, light, "light", "mdi:lightbulb", "HIGH");
     });
-    self.spa.getBlowers().forEach(blower => {
-      self.componentSwitchDiscovery(self.spa, blower, "blower", "mdi:weather-windy");
-      self.componentBinarySensorDiscovery(self.spa, blower, "blower", "mdi:weather-windy", "HIGH");
+    spa.getBlowers().forEach(blower => {
+      self.componentSwitchDiscovery(spa, blower, "blower", "mdi:weather-windy");
+      self.componentBinarySensorDiscovery(spa, blower, "blower", "mdi:weather-windy", "HIGH");
     });
-    self.spa.getPumps().forEach(pump => {
-      self.componentSwitchDiscovery(self.spa, pump, "pump", "mdi:fan");
-      self.componentBinarySensorDiscovery(self.spa, pump, "pump", "mdi:fan", "HIGH");
+    spa.getPumps().forEach(pump => {
+      self.componentSwitchDiscovery(spa, pump, "pump", "mdi:fan");
+      self.componentBinarySensorDiscovery(spa, pump, "pump", "mdi:fan", "HIGH");
     });
-    self.spa.getCirculationPumps().forEach(pump => {
-      self.componentBinarySensorDiscovery(self.spa, pump, "circulation_pump", "mdi:sync", "HIGH");
+    spa.getCirculationPumps().forEach(pump => {
+      self.componentBinarySensorDiscovery(spa, pump, "circulation_pump", "mdi:sync", "HIGH");
     });
-    self.spa.getOzone().forEach(ozone => {
-      self.componentBinarySensorDiscovery(self.spa, ozone, "ozone", "mdi:air-filter", "ON");
+    spa.getOzone().forEach(ozone => {
+      self.componentBinarySensorDiscovery(spa, ozone, "ozone", "mdi:air-filter", "ON");
     });
-    self.spa.getHeaters().forEach(heater => {
-      self.componentBinarySensorDiscovery(self.spa, heater, "heater", "mdi:radiator", "ON");
+    spa.getHeaters().forEach(heater => {
+      self.componentBinarySensorDiscovery(spa, heater, "heater", "mdi:radiator", "ON");
     });
-    self.spa.getFilters().forEach(filter => {
-      self.componentFilterDiscovery(self.spa, filter, "filter", "mdi:air-filter");
-      self.componentSensorDiscovery(self.spa, filter, "filter", "mdi:air-filter", "ON", "OFF", "DISABLED");
+    spa.getFilters().forEach(filter => {
+      self.componentFilterDiscovery(spa, filter, "filter", "mdi:air-filter");
+      self.componentSensorDiscovery(spa, filter, "filter", "mdi:air-filter", "ON", "OFF", "DISABLED");
     });
     logInfo("Ending mqtt discovery");
   }
@@ -543,7 +565,7 @@ class App extends EventEmitter {
       "manufacturer": deviceInfo.dealerName,
       "model": deviceInfo.model,
       "identifiers": [deviceInfo.serialNumber, spaId],
-      "name": "ControlMySpa",
+      "name": spa.getDisplayName(),
       "suggested_area": "Spa"
     };
     return device;
@@ -609,14 +631,30 @@ class App extends EventEmitter {
     self.mqtt.publish("homeassistant/climate/" + objectId + "/config", JSON.stringify(config), { retain: true });
   }
 
+  getSpaForTopic(topic) {
+    const parts = topic.split('/');
+    if (parts.length < 2) return null;
+    const spaId = parts[1]; // controlmyspa/{spaId}/...
+    return this.spas.find(s => s.getSpaId() === spaId) || null;
+  }
+
   handleMessage(topic, payload) {
     let self = this;
     if (topic === self.config.hassTopic) {
       logInfo("HA reloaded");
-      self.publishSpaState();
-      self.discovery();
+      self.spas.forEach(spa => {
+        self.publishSpaState(spa);
+        self.discovery(spa);
+      });
       return;
     }
+
+    const spa = self.getSpaForTopic(topic);
+    if (!spa) {
+      logError(`No spa found for topic ${topic}`);
+      return;
+    }
+
     let parts = topic.split("/");
     let id;
     let command = parts.pop();
@@ -635,93 +673,85 @@ class App extends EventEmitter {
     
     switch(command) {
       case 'refresh': 
-        self.spa.updateSpa();
+        spa.updateSpa();
         break;
       case 'heaterMode': 
-        self.toggleHeaterMode(payload);
+        self.toggleHeaterMode(spa, payload);
         break;
       case 'tempRange':
-        self.setTempRange(payload);
+        self.setTempRange(spa, payload);
         break;
       case 'temp':
-        self.setTemp(payload);
+        self.setTemp(spa, payload);
         break;
       case 'panelLock':
-        self.setPanelLock(payload);
+        self.setPanelLock(spa, payload);
         break;
       case 'light':
-        self.setLightState(id, payload);
+        self.setLightState(spa, id, payload);
         break;
       case 'blower':
-        self.setBlowerState(id, payload);
+        self.setBlowerState(spa, id, payload);
         break;
       case 'pump':
-        self.setJetState(id, payload);
+        self.setJetState(spa, id, payload);
         break;   
       case 'filter':
-        self.setFilterSchedule(id, subCommand, payload);
+        self.setFilterSchedule(spa, id, subCommand, payload);
         break;
       case 'timeSync':
-        self.syncTime();
+        self.syncTime(spa);
         break;
       default:
         logError(`Unrecognized command ${command}`)
     } 
   }
 
-  setFilterSchedule(id, subCommand, payload) {
+  setFilterSchedule(spa, id, subCommand, payload) {
     logDebug(`Setting filter schedule for id ${id}, subCommand ${subCommand}, payload ${payload}`);
     let self = this;
     if (!id || !subCommand) {
       logError(`Invalid filter command: id or subCommand is missing`);
       return;
     }
-    self.spa.setFilterSchedule(id, subCommand, payload);
+    spa.setFilterSchedule(id, subCommand, payload);
   }
 
-  syncTime() {
-    let self = this;
+  syncTime(spa) {
     logDebug("Syncing time with spa");
-    self.spa.syncTime();
+    spa.syncTime();
   }
 
-  toggleHeaterMode(payload) {
-    let self = this;
-    self.spa.toggleHeaterMode();
+  toggleHeaterMode(spa, payload) {
+    spa.toggleHeaterMode();
   }
 
-  setTempRange(payload) {
-    let self = this;
+  setTempRange(spa, payload) {
     if("TOGGLE" === payload) {
-      self.spa.toggleTempRange();
+      spa.toggleTempRange();
     } else {
-      self.spa.setTempRange("HIGH" === payload);
+      spa.setTempRange("HIGH" === payload);
     }
   }
 
-  setTemp(payload) {
-    let self = this;
-    self.spa.setTemp(parseFloat(payload).toFixed(1))
+  setTemp(spa, payload) {
+    spa.setTemp(parseFloat(payload).toFixed(1));
   }
 
-  setPanelLock(payload) {
-    let self = this;
-    self.spa.setPanelLock(payload === 'LOCK');
+  setPanelLock(spa, payload) {
+    spa.setPanelLock(payload === 'LOCK');
   }
 
-  setLightState(id, payload) {
-    let self = this;
-    self.spa.setLightState(id, payload);
+  setLightState(spa, id, payload) {
+    spa.setLightState(id, payload);
   }
 
-  setBlowerState(id, payload) {
-    let self = this;
-    self.spa.setBlowerState(id, payload);
+  setBlowerState(spa, id, payload) {
+    spa.setBlowerState(id, payload);
   }
 
-  setJetState(id, payload) {
-    let self = this;
-    self.spa.setJetState(id, payload);
+  setJetState(spa, id, payload) {
+    spa.setJetState(id, payload);
   }
 }
 const app = new App(config);
